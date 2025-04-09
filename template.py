@@ -5,6 +5,8 @@ from datamodel import *
 from typing import List, Dict, Tuple, Any
 import json
 
+INF = 1e9
+normalDist = NormalDist(0,1)
 
 class Logger:
     def __init__(self) -> None:
@@ -746,98 +748,7 @@ class Strategy:
         if sell_amount > 0:
             orders.append(Order(state.product, int(p_a), -int(sell_amount)))
         return orders
-
-    @staticmethod
-    def exchange_arb(state: Status, fair_price, next_price_move=0):
-        cost = state.transportFees + state.importTariff
-
-        my_ask = state.maxamt_bidprc
-        ask_max_expected_profit = 0
-        optimal_my_ask = INF
-        while my_ask < fair_price:
-            delta = my_ask - fair_price
-            execution_prob = ExecutionProb.orchids(delta)
-
-            if my_ask > state.best_bid:
-                trading_profit = my_ask - (state.orchid_south_askprc + next_price_move)
-                expected_profit = execution_prob * (trading_profit - cost)
-             
-            else:
-                execution_prob_list = []
-                price_list = []
-                amount_list = []
-
-                for price, amount in state.bids:
-                    if price >= my_ask:
-                        execution_prob_list.append(1)
-                        price_list.append(price)
-                        amount_list.append(amount)
-
-                total_amount = np.sum(amount_list)
-                if total_amount < state.position_limit:
-                    execution_prob_list.append(ExecutionProb.orchids(delta))
-                    price_list.append(my_ask)
-                    amount_list.append(state.position_limit - total_amount)
-
-                trading_profit_list = np.array(price_list) - (state.orchid_south_askprc + next_price_move)
-                expected_profit = (np.array(execution_prob_list) * (np.array(trading_profit_list) - cost) * np.array(amount_list) / state.position_limit).sum()
-
-            if expected_profit > ask_max_expected_profit:
-                optimal_my_ask = my_ask
-                ask_max_expected_profit = expected_profit
-            
-            my_ask += 1
-
-
-        cost = state.transportFees + state.exportTariff + state.stoarageFees
-
-        my_bid = state.maxamt_askprc
-        bid_max_expected_profit = 0
-        optimal_my_bid = 1
-        while my_bid > fair_price:
-            delta = fair_price - my_bid
-            execution_prob = ExecutionProb.orchids(delta)
-
-            if my_bid < state.best_ask:
-                trading_profit = (state.orchid_south_bidprc + next_price_move) - my_bid
-                expected_profit = execution_prob * (trading_profit - cost)
-             
-            else:
-                execution_prob_list = []
-                price_list = []
-                amount_list = []
-
-                for price, amount in state.asks:
-                    if price <= my_bid:
-                        execution_prob_list.append(1)
-                        price_list.append(price)
-                        amount_list.append(abs(amount))
-
-                total_amount = np.sum(amount_list)
-                if total_amount < state.position_limit:
-                    execution_prob_list.append(ExecutionProb.orchids(delta))
-                    price_list.append(my_bid)
-                    amount_list.append(state.position_limit - total_amount)
-
-                trading_profit_list = (state.orchid_south_bidprc + next_price_move) - np.array(price_list)
-                expected_profit = (np.array(execution_prob_list) * (np.array(trading_profit_list) - cost) * np.array(amount_list) / state.position_limit).sum()
-
-            if expected_profit > bid_max_expected_profit:
-                optimal_my_bid = my_bid
-                bid_max_expected_profit = expected_profit
-            
-            my_bid -= 1
-            
-
-        orders = []
-        
-        if ask_max_expected_profit >= bid_max_expected_profit and ask_max_expected_profit > 0:
-            orders.append(Order(state.product, int(optimal_my_ask), -int(state.position_limit)))
-        elif bid_max_expected_profit > ask_max_expected_profit and bid_max_expected_profit > 0:
-            orders.append(Order(state.product, int(optimal_my_bid), int(state.position_limit)))
-        
-        return orders
-
+    
     @staticmethod
     def convert(state: Status):
         if state.position < 0:
@@ -933,54 +844,63 @@ class Strategy:
 
 class Trade:
 
+    # @staticmethod   
+    # def amethysts(state: Status) -> list[Order]:
+
+    #     current_price = state.maxamt_midprc
+
+    #     orders = []
+    #     orders.extend(Strategy.arb(state=state, fair_price=current_price))
+    #     orders.extend(Strategy.mm_ou(state=state, fair_price=current_price, gamma=0.1, order_amount=20))
+
+    #     return orders
+
     @staticmethod   
-    def amethysts(state: Status) -> list[Order]:
+    def squid(state: Status) -> list[Order]:
 
         current_price = state.maxamt_midprc
 
         orders = []
         orders.extend(Strategy.arb(state=state, fair_price=current_price))
-        orders.extend(Strategy.mm_ou(state=state, fair_price=current_price, gamma=0.1, order_amount=20))
+        # orders.extend(Strategy.mm_ou(state=state, fair_price=current_price, gamma=0.1, order_amount=20))
 
         return orders
     
-    @staticmethod
-    def starfruit(state: Status) -> list[Order]:
-
-        current_price = state.maxamt_midprc
-
-        orders = []
-        orders.extend(Strategy.arb(state=state, fair_price=current_price))
-        orders.extend(Strategy.mm_glft(state=state, fair_price=current_price, gamma=0.1, order_amount=20))
-
-        return orders
 
 class Trader:
 
     # state_amethysts = Status('AMETHYSTS')
+    state_squid = Status('SQUID_INK')
 
     def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
         Status.cls_update(state)
 
         result = {}
+        conversions = 0
+        traderData = ""
 
         # round 1
-        result["AMETHYSTS"] = Trade.amethysts(self.state_amethysts)
-        result["STARFRUIT"] = Trade.starfruit(self.state_starfruit)
+        # result["AMETHYSTS"] = Trade.amethysts(self.state_amethysts)
+        result["SQUID_INK"] = Trade.squid(self.state_squid)
         
-        # round 2
-        result["ORCHIDS"] = Trade.orchids(self.state_orchids)
-        conversions = Trade.convert(self.state_orchids)
+        # # round 2
+        # result["ORCHIDS"] = Trade.orchids(self.state_orchids)
+        # conversions = Trade.convert(self.state_orchids)
 
-        # round 3
-        result["GIFT_BASKET"] = Trade.gift_basket(self.state_gift_basket, self.state_chocolate, self.state_strawberries, self.state_roses)
-        result["ROSES"] = Trade.roses(self.state_roses)
+        # # round 3
+        # result["GIFT_BASKET"] = Trade.gift_basket(self.state_gift_basket, self.state_chocolate, self.state_strawberries, self.state_roses)
+        # result["ROSES"] = Trade.roses(self.state_roses)
         
-        # round 4
-        coconut_result = Trade.coconut(self.state_coconut, self.state_coconut_coupon, day=5)
-        result["COCONUT_COUPON"] = coconut_result["COCONUT_COUPON"]
-        # result["COCONUT"] = coconut_result["COCONUT"]
+        # # round 4
+        # coconut_result = Trade.coconut(self.state_coconut, self.state_coconut_coupon, day=5)
+        # result["COCONUT_COUPON"] = coconut_result["COCONUT_COUPON"]
+        # # result["COCONUT"] = coconut_result["COCONUT"]
 
         traderData = "SAMPLE" 
-        logger.flush(state, result, conversions, traderData)
+        # logger.flush(state, result, conversions, traderData)
         return result, conversions, traderData
+    
+
+
+    # testing script
+    # prosperity3bt template.py 1 --data data/ --no-out --print --merge-pnl
