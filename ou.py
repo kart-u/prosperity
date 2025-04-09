@@ -721,10 +721,12 @@ class Strategy:
         if z_score > 1.5 and current_position > -position_limit:
             # Sell signal - price is above mean
             if state.bids:  # Check if there are any bids
-                sell_amount = min(state.rt_position, state.bids.bid_amount)
+                sell_amount = min(state.rt_position, state.bids.b)
                 if sell_amount > 0:
                     orders.append(Order(state.product, int(state.best_bid), -int(sell_amount)))
                     state.rt_position_update(state.rt_position - sell_amount)
+                    state.update_bids(state.bids.bid_price, state.bids.bid_amount - sell_amount)
+                    
         
         elif z_score < -1.5 and current_position < position_limit:
             # Buy signal - price is below mean
@@ -733,6 +735,7 @@ class Strategy:
                 if buy_amount > 0:
                     orders.append(Order(state.product, int(state.best_ask), int(buy_amount)))
                     state.rt_position_update(state.rt_position + buy_amount)
+                    state.update_asks(state.asks.ask_price, -(-state.asks.ask_amount - buy_amount))
         
         elif abs(z_score) < 0.5 and current_position != 0:
             # Mean reversion signal - reduce position when price returns to mean
@@ -742,224 +745,19 @@ class Strategy:
                 if sell_amount > 0:
                     orders.append(Order(state.product, int(state.best_bid), -int(sell_amount)))
                     state.rt_position_update(state.rt_position - sell_amount)
+                    state.update_bids(state.bids.bid_price, state.bids.bid_amount - sell_amount)
+
+
             elif current_position < 0 and state.asks:
                 # Buy to reduce short position
                 buy_amount = min(-state.asks.ask_amount, -state.rt_position)
                 if buy_amount > 0:
                     orders.append(Order(state.product, int(state.best_ask), int(buy_amount)))
                     state.rt_position_update(state.rt_position + buy_amount)
+                    state.update_asks(state.asks.ask_price, -(-state.asks.ask_amount - buy_amount))
         
         return orders
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    @staticmethod
-    def mm_glft(
-        state: Status,
-        fair_price,
-        mu=0,
-        sigma=0.3959,
-        gamma=1e-9,
-        order_amount=20,
-    ):
-        
-        q = state.rt_position / order_amount
-        #Q = state.position_limit / order_amount
-
-        kappa_b = 1 / max((fair_price - state.best_bid) - 1, 1)
-        kappa_a = 1 / max((state.best_ask - fair_price) - 1, 1)
-
-        A_b = 0.25
-        A_a = 0.25
-
-        delta_b = 1 / gamma * math.log(1 + gamma / kappa_b) + (-mu / (gamma * sigma**2) + (2 * q + 1) / 2) * math.sqrt((sigma**2 * gamma) / (2 * kappa_b * A_b) * (1 + gamma / kappa_b)**(1 + kappa_b / gamma))
-        delta_a = 1 / gamma * math.log(1 + gamma / kappa_a) + (mu / (gamma * sigma**2) - (2 * q - 1) / 2) * math.sqrt((sigma**2 * gamma) / (2 * kappa_a * A_a) * (1 + gamma / kappa_a)**(1 + kappa_a / gamma))
-
-        p_b = round(fair_price - delta_b)
-        p_a = round(fair_price + delta_a)
-
-        p_b = min(p_b, fair_price) # Set the buy price to be no higher than the fair price to avoid losses
-        p_b = min(p_b, state.best_bid + 1) # Place the buy order as close as possible to the best bid price
-        p_b = max(p_b, state.maxamt_bidprc + 1) # No market order arrival beyond this price
-
-        p_a = max(p_a, fair_price)
-        p_a = max(p_a, state.best_ask - 1)
-        p_a = min(p_a, state.maxamt_askprc - 1)
-
-        buy_amount = min(order_amount, state.possible_buy_amt)
-        sell_amount = min(order_amount, state.possible_sell_amt)
-
-        orders = []
-        if buy_amount > 0:
-            orders.append(Order(state.product, int(p_b), int(buy_amount)))
-        if sell_amount > 0:
-            orders.append(Order(state.product, int(p_a), -int(sell_amount)))
-        return orders
-
-    
-
-
-
-
-    @staticmethod
-    def mm_ou(
-        state: Status,
-        fair_price,
-        gamma=1e-9,
-        order_amount=20,
-    ):
-
-        q = state.rt_position / order_amount
-        Q = state.position_limit / order_amount
-
-        kappa_b = 1 / max((fair_price - state.best_bid) - 1, 1)
-        kappa_a = 1 / max((state.best_ask - fair_price) - 1, 1)
-            
-        vfucn = lambda q,Q: -INF if (q==Q+1 or q==-(Q+1)) else math.log(math.sin(((q+Q+1)*math.pi)/(2*Q+2)))
-
-        delta_b = 1 / gamma * math.log(1 + gamma / kappa_b) - 1 / kappa_b * (vfucn(q + 1, Q) - vfucn(q, Q))
-        delta_a = 1 / gamma * math.log(1 + gamma / kappa_a) + 1 / kappa_a * (vfucn(q, Q) - vfucn(q - 1, Q))
-
-        p_b = round(fair_price - delta_b)
-        p_a = round(fair_price + delta_a)
-
-        p_b = min(p_b, fair_price) # Set the buy price to be no higher than the fair price to avoid losses
-        p_b = min(p_b, state.best_bid + 1) # Place the buy order as close as possible to the best bid price
-        p_b = max(p_b, state.maxamt_bidprc + 1) # No market order arrival beyond this price
-
-        p_a = max(p_a, fair_price)
-        p_a = max(p_a, state.best_ask - 1)
-        p_a = min(p_a, state.maxamt_askprc - 1)
-
-        buy_amount = min(order_amount, state.possible_buy_amt)
-        sell_amount = min(order_amount, state.possible_sell_amt)
-
-        orders = []
-        if buy_amount > 0:
-            orders.append(Order(state.product, int(p_b), int(buy_amount)))
-        if sell_amount > 0:
-            orders.append(Order(state.product, int(p_a), -int(sell_amount)))
-        return orders
-    
-    @staticmethod
-    def convert(state: Status):
-        if state.position < 0:
-            return -state.position
-        elif state.position > 0:
-            return -state.position
-        else:
-            return 0
-        
-    @staticmethod
-    def index_arb(
-        basket: Status,
-        chocolate: Status,
-        strawberries: Status,
-        roses: Status,
-        theta=380,
-        threshold=30,
-    ):
-        
-        basket_prc = basket.mid
-        underlying_prc = 4 * chocolate.vwap + 6 * strawberries.vwap + 1 * roses.vwap
-        spread = basket_prc - underlying_prc
-        norm_spread = spread - theta
-
-        orders = []
-        if norm_spread > threshold:
-            orders.append(Order(basket.product, int(basket.worst_bid), -int(basket.possible_sell_amt)))
-        elif norm_spread < -threshold:
-            orders.append(Order(basket.product, int(basket.worst_ask), int(basket.possible_buy_amt)))
-
-        return orders
-    
-    @staticmethod
-    def vol_arb(option: Status, iv, hv=0.16, threshold=0.00178):
-
-        vol_spread = iv - hv
-
-        orders = []
-
-        if vol_spread > threshold:
-            sell_amount = option.possible_sell_amt
-            orders.append(Order(option.product, option.worst_bid, -sell_amount))
-            executed_amount = min(sell_amount, option.total_bidamt)
-            option.rt_position_update(option.rt_position - executed_amount)
-
-        elif vol_spread < -threshold:
-            buy_amount = option.possible_buy_amt
-            orders.append(Order(option.product, option.worst_ask, buy_amount))
-            executed_amount = min(buy_amount, option.total_askamt)
-            option.rt_position_update(option.rt_position + executed_amount)
-
-        return orders
-    
-    @staticmethod
-    def delta_hedge(underlying: Status, option: Status, delta, rebalance_threshold=30):
-
-        target_position = -round(option.rt_position * delta)
-        current_position = underlying.position
-        position_diff = target_position - current_position
-
-        orders = []
-
-        if underlying.bid_ask_spread == 1 and abs(position_diff) > rebalance_threshold:
-
-            if position_diff < 0:
-                sell_amount = min(abs(position_diff), underlying.possible_sell_amt)
-                orders.append(Order(underlying.product, underlying.best_bid, -sell_amount))
-
-            elif position_diff > 0:
-                buy_amount = min(position_diff, underlying.possible_buy_amt)
-                orders.append(Order(underlying.product, underlying.best_ask, buy_amount))
-        
-        return orders
-    
-    @staticmethod
-    def insider_trading(signal_product: Status, trade_product: Status):
-
-        buy_timestamp, sell_timestamp = 0, 0
-
-        for trade in signal_product.market_trades:
-            if trade.buyer == "Rhianna":
-                buy_timestamp = trade.timestamp
-            elif trade.seller == "Rhianna":
-                sell_timestamp = trade.timestamp
-
-        orders = []
-        if buy_timestamp > sell_timestamp:
-            orders.append(Order(trade_product.product, trade_product.worst_ask, trade_product.possible_buy_amt))
-        elif buy_timestamp < sell_timestamp:
-            orders.append(Order(trade_product.product, trade_product.worst_bid, -trade_product.possible_sell_amt))
-
-        return orders
 
 class Trade:
 
@@ -980,8 +778,8 @@ class Trade:
         current_price = state.maxamt_midprc
 
         orders = []
-        orders.extend(Strategy.arb(state=state, fair_price=current_price))
-        # orders.extend(Strategy.mm_glft(state=state, fair_price=current_price, gamma=0.1, order_amount=8))
+        # orders.extend(Strategy.arb(state=state, fair_price=current_price))
+        orders.extend(Strategy.ou_trading_strategy(state=state,lookback=20))
 
         return orders
     
@@ -1003,11 +801,11 @@ class Trader:
         result["SQUID_INK"] = Trade.squid(self.state_squid)
         
 
-        traderData = "SAMPLE" 
+        # traderData = "SAMPLE" 
         # logger.flush(state, result, conversions, traderData)
         return result, conversions, traderData
     
 
 
     # testing script
-    # prosperity3bt template.py 1 --data data/ --no-out --print --merge-pnl
+    # prosperity3bt ou.py 1 --data data/ --no-out --print --merge-pnl
