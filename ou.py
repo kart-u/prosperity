@@ -8,6 +8,26 @@ import json
 INF = 1e9
 normalDist = NormalDist(0,1)
 
+
+def is_mean_reverting(prices: np.ndarray, window: int = 20) -> bool:
+        """
+        Test if a price series is mean-reverting using variance ratio test.
+        Lower short-term to long-term variance ratio suggests mean reversion.
+        """
+        if len(prices) < 30:
+            return False
+            
+        # Calculate returns
+        returns = np.diff(np.log(prices))
+        
+        # Calculate variance ratios
+        short_var = np.var(returns)
+        long_var = np.var(np.sum(returns.reshape(-1, window), axis=1)) / window
+        
+        # Mean reversion indicated by variance ratio < 0.8
+        return (short_var / long_var) < 0.8
+
+
 class Logger:
     def __init__(self) -> None:
         self.logs = ""
@@ -135,6 +155,8 @@ class Status:
 
     _realtime_position = {key:0 for key in _position_limit.keys()}
 
+   
+
     _hist_order_depths = {
         product:{
             'bidprc1': [],
@@ -150,6 +172,7 @@ class Status:
             'askprc3': [],
             # amt is volume
             'askamt3': [],
+            'fair_prices':[],
         } for product in _position_limit.keys()
     }
 
@@ -186,7 +209,10 @@ class Status:
         # Update historical order_depths
         for product, orderdepth in state.order_depths.items():
             cnt = 1
+            mx=0
+            mn=1e9
             for prc, amt in sorted(orderdepth.sell_orders.items(), reverse=False):
+                mx=max(mx,amt)
                 cls._hist_order_depths[product][f'askamt{cnt}'].append(amt)
                 cls._hist_order_depths[product][f'askprc{cnt}'].append(prc)
                 cnt += 1
@@ -198,6 +224,7 @@ class Status:
                 cnt += 1
             cnt = 1
             for prc, amt in sorted(orderdepth.buy_orders.items(), reverse=True):
+                mn=min(mn,prc)
                 cls._hist_order_depths[product][f'bidprc{cnt}'].append(prc)
                 cls._hist_order_depths[product][f'bidamt{cnt}'].append(amt)
                 cnt += 1
@@ -207,8 +234,8 @@ class Status:
                 cls._hist_order_depths[product][f'bidprc{cnt}'].append(np.nan)
                 cls._hist_order_depths[product][f'bidamt{cnt}'].append(np.nan)
                 cnt += 1
+            cls._hist_order_depths[product]['fair_prices'].append((mx+mn)//2)
         cls._num_data += 1
-        
         # cls._hist_observation['sunlight'].append(state.observations.conversionObservations['ORCHIDS'].sunlight)
         # cls._hist_observation['humidity'].append(state.observations.conversionObservations['ORCHIDS'].humidity)
         # cls._hist_observation['transportFees'].append(state.observations.conversionObservations['ORCHIDS'].transportFees)
@@ -627,6 +654,33 @@ class Status:
     @property
     def market_trades(self) -> list:
         return self._state.market_trades.get(self.product, [])
+    
+    @classmethod
+    def _cls_fair(cls,product)->List:
+        return cls._hist_order_depths[product]['fair_prices']
+    @property
+    def iv(self, window: int = 20) -> float:
+        product=self.product
+        prices = self._cls_fair(product)
+        if len(prices) >= window + 1:
+            returns = [(prices[i+1] - prices[i]) / prices[i] for i in range(-window - 1, -1)]
+            mean_return = sum(returns) / len(returns)
+            variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+            std_dev = variance ** 0.5
+            return std_dev * (len(returns) ** 0.5)  # approximate scaling
+        return 0.16  # fallback
+    
+
+    @property
+    def hv(self, window: int = 20) -> float:
+        product=self.product
+        prices = self._cls_fair(product)
+        if len(prices) >= window + 1:
+            returns = [(prices[i+1] - prices[i]) / prices[i] for i in range(-window - 1, -1)]
+            squared_returns = [r ** 2 for r in returns]
+            hv = sum(squared_returns) / len(squared_returns)
+            return hv ** 0.5
+        return 0.16  # fallback
 
 class Strategy:
 
@@ -665,97 +719,69 @@ class Strategy:
                     state.update_bids(bid_price, bid_amount - sell_amount)
 
         return orders
-
-    def ou_trading_strategy(state: Status, lookback: int = 50) -> list[Order]:
-        """
-        Implements an Ornstein-Uhlenbeck mean reversion trading strategy using the Status class.
+    
+    @staticmethod
+    def mm_glft(
+        state: Status,
+        fair_price,
+        mu=0,
+        sigma=0.45,
+        gamma=1e-9,
+        order_amount=1000,
+    ):
         
-        Args:
-            state: Status object containing market data for a product
-            lookback: Number of historical data points to use for parameter estimation
-            
-        Returns:
-            List of Order objects representing trading actions
-        """
-        # Initialize orders list
+        q = state.rt_position / order_amount
+        #Q = state.position_limit / order_amount
+
+        kappa_b = 1 / max((fair_price - state.best_bid) - 1, 1)
+        kappa_a = 1 / max((state.best_ask - fair_price) - 1, 1)
+
+        A_b = 0.25
+        A_a = 0.25
+
+        delta_b = 1 / gamma * math.log(1 + gamma / kappa_b) + (-mu / (gamma * sigma**2) + (2 * q + 1) / 2) * math.sqrt((sigma**2 * gamma) / (2 * kappa_b * A_b) * (1 + gamma / kappa_b)**(1 + kappa_b / gamma))
+        delta_a = 1 / gamma * math.log(1 + gamma / kappa_a) + (mu / (gamma * sigma**2) - (2 * q - 1) / 2) * math.sqrt((sigma**2 * gamma) / (2 * kappa_a * A_a) * (1 + gamma / kappa_a)**(1 + kappa_a / gamma))
+
+        p_b = round(fair_price - delta_b)
+        p_a = round(fair_price + delta_a)
+
+        p_b = min(p_b, fair_price) # Set the buy price to be no higher than the fair price to avoid losses
+        p_b = min(p_b, state.best_bid + 1) # Place the buy order as close as possible to the best bid price
+        p_b = max(p_b, state.maxamt_bidprc + 1) # No market order arrival beyond this price
+
+        p_a = max(p_a, fair_price)
+        p_a = max(p_a, state.best_ask - 1)
+        p_a = min(p_a, state.maxamt_askprc - 1)
+
+        buy_amount = min(order_amount, state.possible_buy_amt)
+        sell_amount = min(order_amount, state.possible_sell_amt)
+
         orders = []
-        
-        # Check if we have enough historical data
-        if state._num_data < 20:
-            return orders
-        
-        # Get price history using Status class methods
-        prices = state.hist_mid_prc(min(lookback, state._num_data))
-        
-        # Skip if not enough data points
-        if len(prices) < 20:
-            return orders
-        
-        # Calculate parameters using log prices
-        log_prices = np.log(prices)
-        returns = np.diff(log_prices)
-        lag_returns = log_prices[:-1]
-        
-        # Linear regression to estimate mean reversion
-        X = np.column_stack((np.ones(len(lag_returns)), lag_returns))
-        y = returns
-        beta = np.linalg.lstsq(X, y, rcond=None)[0]
-        
-        # Extract parameters
-        theta = max(0.001, -beta[1])  # Ensure positive mean reversion, default is 0.05
-        mu = -beta[0]/theta           # Long-term mean level
-        
-        # Estimate volatility from residuals
-        residuals = y - (beta[0] + beta[1] * lag_returns)
-        sigma = np.std(residuals)
-        
-        # Calculate current price and z-score
-        current_price = prices[-1]
-        z_score = (np.log(current_price) - mu) / sigma if sigma > 0 else 0
-        
-        # Current position and position limit from Status class
-        current_position = state.rt_position
-        position_limit = state.position_limit
-        
-        # Trading logic based on z-score and position
-        if z_score > 1.5 and current_position > -position_limit:
-            # Sell signal - price is above mean
-            if state.bids:  # Check if there are any bids
-                sell_amount = min(state.rt_position, state.bids.b)
-                if sell_amount > 0:
-                    orders.append(Order(state.product, int(state.best_bid), -int(sell_amount)))
-                    state.rt_position_update(state.rt_position - sell_amount)
-                    state.update_bids(state.bids.bid_price, state.bids.bid_amount - sell_amount)
-                    
-        
-        elif z_score < -1.5 and current_position < position_limit:
-            # Buy signal - price is below mean
-            if state.asks:  # Check if there are any asks
-                buy_amount = min(-state.asks.ask_amount, -state.rt_position)
-                if buy_amount > 0:
-                    orders.append(Order(state.product, int(state.best_ask), int(buy_amount)))
-                    state.rt_position_update(state.rt_position + buy_amount)
-                    state.update_asks(state.asks.ask_price, -(-state.asks.ask_amount - buy_amount))
-        
-        elif abs(z_score) < 0.5 and current_position != 0:
-            # Mean reversion signal - reduce position when price returns to mean
-            if current_position > 0 and state.bids:
-                # Sell to reduce long position
-                sell_amount = min(state.rt_position, state.bids.bid_amount)
-                if sell_amount > 0:
-                    orders.append(Order(state.product, int(state.best_bid), -int(sell_amount)))
-                    state.rt_position_update(state.rt_position - sell_amount)
-                    state.update_bids(state.bids.bid_price, state.bids.bid_amount - sell_amount)
+        if buy_amount > 0:
+            orders.append(Order(state.product, int(p_b), int(buy_amount)))
+        if sell_amount > 0:
+            orders.append(Order(state.product, int(p_a), -int(sell_amount)))
+        return orders
+    
+    @staticmethod
+    def vol_arb(option: Status,threshold=0.0018):
 
+        vol_spread = option.iv - option.hv
 
-            elif current_position < 0 and state.asks:
-                # Buy to reduce short position
-                buy_amount = min(-state.asks.ask_amount, -state.rt_position)
-                if buy_amount > 0:
-                    orders.append(Order(state.product, int(state.best_ask), int(buy_amount)))
-                    state.rt_position_update(state.rt_position + buy_amount)
-                    state.update_asks(state.asks.ask_price, -(-state.asks.ask_amount - buy_amount))
-        
+        orders = []
+
+        if vol_spread > threshold:
+            sell_amount = option.possible_sell_amt
+            orders.append(Order(option.product, option.worst_bid, -sell_amount))
+            executed_amount = min(sell_amount, option.total_bidamt)
+            option.rt_position_update(option.rt_position - executed_amount)
+
+        elif vol_spread < -threshold:
+            buy_amount = option.possible_buy_amt
+            orders.append(Order(option.product, option.worst_ask, buy_amount))
+            executed_amount = min(buy_amount, option.total_askamt)
+            option.rt_position_update(option.rt_position + executed_amount)
+
         return orders
 
 
@@ -767,10 +793,11 @@ class Trade:
     #     current_price = state.maxamt_midprc
 
     #     orders = []
-    #     orders.extend(Strategy.arb(state=state, fair_price=current_price))
+        # orders.extend(Strategy.arb(state=state, fair_price=current_price))
     #     orders.extend(Strategy.mm_ou(state=state, fair_price=current_price, gamma=0.1, order_amount=20))
 
     #     return orders
+
 
     @staticmethod   
     def squid(state: Status) -> list[Order]:
@@ -778,8 +805,8 @@ class Trade:
         current_price = state.maxamt_midprc
 
         orders = []
-        # orders.extend(Strategy.arb(state=state, fair_price=current_price))
-        orders.extend(Strategy.ou_trading_strategy(state=state,lookback=20))
+        orders.extend(Strategy.vol_arb(option=state))
+        # orders.extend(Strategy.mm_glft(state=state,fair_price=current_price))
 
         return orders
     
