@@ -666,6 +666,9 @@ class Strategy:
 
         return orders
 
+
+
+
     @staticmethod
     def mm_glft(
         state: Status,
@@ -708,6 +711,11 @@ class Strategy:
         if sell_amount > 0:
             orders.append(Order(state.product, int(p_a), -int(sell_amount)))
         return orders
+
+
+
+
+
 
     @staticmethod
     def mm_ou(
@@ -861,8 +869,8 @@ class Trade:
         current_price = state.maxamt_midprc
 
         orders = []
-        orders.extend(Strategy.arb(state=state, fair_price=current_price))
-        # orders.extend(Strategy.mm_ou(state=state, fair_price=current_price, gamma=0.1, order_amount=20))
+        # orders.extend(Strategy.arb(state=state, fair_price=current_price))
+        orders.extend(Strategy.mm_glft(state=state, fair_price=current_price, gamma=0.1, order_amount=8))
 
         return orders
     
