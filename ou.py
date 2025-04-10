@@ -697,6 +697,116 @@ class Status:
 
 class Strategy:
     @staticmethod
+    def improve3(state: Status,
+                 window: int = 20,
+                 long_window_mult: int = 3,
+                 iv_threshold: float = 0.2,
+                 z_threshold: float = 1.5,
+                 spread_threshold: int = 1,
+                 trade_size_fraction: float = 0.3,
+                 slope_window: int = 5,      # **ADDED: Window for MA slope calc**
+                 max_ma_slope: float = 0.1): # **ADDED: Threshold for MA slope**
+        """
+        Further Corrected: Uses MA slope as a stronger trend filter.
+        Disables trading if the long-term MA slope is too steep.
+
+        Args:
+            # ... (previous args) ...
+            slope_window (int): How many steps back to compare long MA for slope calc.
+            max_ma_slope (float): Max absolute slope allowed for long MA to permit trading.
+
+        Returns:
+            List[Order]: A list of orders to be placed.
+        """
+        orders: List[Order] = []
+        long_window = window * long_window_mult
+
+        # --- Data Availability Checks ---
+        historical_fair_prices = state.fair_price
+        # Need enough data for long window + slope lookback
+        if len(historical_fair_prices) < long_window + slope_window:
+            return orders
+
+        # --- Calculate Metrics ---
+        # Get prices needed for current short/long MA and previous long MA
+        all_prices = np.array(historical_fair_prices[-(long_window + slope_window):], dtype=float)
+        all_prices = all_prices[~np.isnan(all_prices)] # Clean NaNs once
+
+        # Ensure enough valid data points remain after cleaning
+        if len(all_prices) < max(long_window // 2, window // 2) + slope_window:
+             return orders
+
+        # Calculate current short-term mean/std/price
+        prices_short = all_prices[-window:]
+        if len(prices_short) < max(2, window // 2): return orders # Check again for short window slice
+        mean_price_short = np.mean(prices_short)
+        std_price_short = np.std(prices_short)
+        current_price = prices_short[-1]
+
+        if std_price_short == 0: return orders
+
+        # Calculate current long-term mean
+        prices_long_current = all_prices[-long_window:]
+        if len(prices_long_current) < max(2, long_window // 2): return orders # Check long slice
+        mean_price_long_current = np.mean(prices_long_current)
+
+        # Calculate previous long-term mean for slope
+        prices_long_prev = all_prices[-(long_window + slope_window):-slope_window]
+        if len(prices_long_prev) < max(2, long_window // 2): return orders # Check prev long slice
+        mean_price_long_prev = np.mean(prices_long_prev)
+
+        # --- Trend Filter (MA Slope) ---
+        long_ma_slope = (mean_price_long_current - mean_price_long_prev) / slope_window
+        if abs(long_ma_slope) > max_ma_slope:
+             # Slope too steep (strong trend), disable mean-reversion trades
+             return orders
+
+        # --- Get Current VWAP and Spread ---
+        current_vwap = state.vwap
+        current_spread = state.bid_ask_spread
+        if current_vwap is None or current_spread is None: return orders
+
+        # --- Volatility and Spread Filters ---
+        try:
+            current_iv = state.iv
+            if current_iv > iv_threshold: return orders
+        except Exception: return orders
+
+        if current_spread > spread_threshold: return orders
+
+        # --- Z-Score Signal ---
+        zscore = (current_price - mean_price_short) / std_price_short
+        if abs(zscore) < z_threshold: return orders
+
+        # --- Trade Execution Logic (using previous comparison filter as well) ---
+
+        # Buy Logic: z < threshold, price < vwap, AND price < long MA (current one)
+        if zscore < -z_threshold and current_price < current_vwap and current_price < mean_price_long_current:
+            available_buy_volume = state.possible_buy_amt
+            if available_buy_volume > 0:
+                best_ask_price = state.best_ask
+                if best_ask_price is not None:
+                    size = max(1, min(int(available_buy_volume * trade_size_fraction), available_buy_volume))
+                    if size > 0:
+                         orders.append(Order(state.product, int(best_ask_price), size))
+                         state.rt_position_update(state.rt_position + size)
+
+        # Sell Logic: z > threshold, price > vwap, AND price > long MA (current one)
+        elif zscore > z_threshold and current_price > current_vwap and current_price > mean_price_long_current:
+             available_sell_volume = state.possible_sell_amt
+             if available_sell_volume > 0:
+                 best_bid_price = state.best_bid
+                 if best_bid_price is not None:
+                      size = max(1, min(int(available_sell_volume * trade_size_fraction), available_sell_volume))
+                      if size > 0:
+                          orders.append(Order(state.product, int(best_bid_price), -size))
+                          state.rt_position_update(state.rt_position - size)
+
+        return orders
+
+
+
+    @staticmethod
     def improve2(state: Status, window: int = 20, num_std: float = 2.0, iv_threshold: float = 0.3):
         orders = []
 
@@ -995,7 +1105,7 @@ class Trade:
         # best till now
         # orders.extend(Strategy.bollinger(state=state))
         # orders.extend(Strategy.improved(state=state))
-        orders.extend(Strategy.improve2(state=state))
+        orders.extend(Strategy.improve3(state=state))
         # orders.extend(Strategy.vol_arb(option=state))  
         # orders.extend(Strategy.mean_strat(state=state,lookback=10))
         # orders.extend(Strategy.kalman(state=state))
