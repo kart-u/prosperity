@@ -922,7 +922,7 @@ class Strategy:
         return orders
     
     @staticmethod
-    def delta_hedge(underlying: Status, option: Status, delta, rebalance_threshold=30):
+    def delta_hedge(underlying: Status, option: Status, delta=0.5, rebalance_threshold=30):
 
         target_position = -round(option.rt_position * delta)
         current_position = underlying.position

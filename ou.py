@@ -144,6 +144,10 @@ class Logger:
 logger = Logger()
 
 class Status:
+    kalman_mean = 0  # Initial estimate of mean
+    kalman_variance = 1  # Initial estimate of variance (uncertainty)
+    kalman_process_variance = 1e-5  # Small value: how much we expect the mean to move
+    kalman_measurement_variance = 1e-2  # Noise in price measurements
 
     _position_limit = {
         "RAINFOREST_RESIN": 50,
@@ -191,6 +195,20 @@ class Status:
 
         """
         self.product = product
+
+    def update_kalman_mean(self, price: float):
+        # Prediction update
+        self.kalman_variance += self.kalman_process_variance
+
+        # Measurement update
+        kalman_gain = self.kalman_variance / (self.kalman_variance + self.kalman_measurement_variance)
+        self.kalman_mean += kalman_gain * (price - self.kalman_mean)
+        self.kalman_variance *= (1 - kalman_gain)
+
+    @property
+    def kalman_filtered_mean(self):
+        return self.kalman_mean
+
 
     @classmethod
     def cls_update(cls, state: TradingState) -> None:
@@ -640,24 +658,19 @@ class Status:
         return -sum(self._state.order_depths[self.product].sell_orders.values())
 
     @property
-    def orchid_south_bidprc(self) -> float:
-        return self._state.observations.conversionObservations[self.product].bidPrice
-    
-    @property
-    def orchid_south_askprc(self) -> float:
-        return self._state.observations.conversionObservations[self.product].askPrice
-    
-    @property
-    def orchid_south_midprc(self) -> float:
-        return (self.orchid_south_bidprc + self.orchid_south_askprc) / 2
-
-    @property
     def market_trades(self) -> list:
         return self._state.market_trades.get(self.product, [])
     
     @classmethod
     def _cls_fair(cls,product)->List:
         return cls._hist_order_depths[product]['fair_prices']
+    
+
+    @property 
+    def fair_price(self)->List:
+        return self._cls_fair(self.product)
+
+
     @property
     def iv(self, window: int = 20) -> float:
         product=self.product
@@ -683,43 +696,151 @@ class Status:
         return 0.16  # fallback
 
 class Strategy:
-
     @staticmethod
-    def arb(state: Status, fair_price):
+    def improve2(state: Status, window: int = 20, num_std: float = 2.0, iv_threshold: float = 0.3):
         orders = []
 
-        for ask_price, ask_amount in state.asks:
-            if ask_price < fair_price:
-                buy_amount = min(-ask_amount, state.possible_buy_amt)
-                if buy_amount > 0:
-                    orders.append(Order(state.product, int(ask_price), int(buy_amount)))
-                    state.rt_position_update(state.rt_position + buy_amount)
-                    state.update_asks(ask_price, -(-ask_amount - buy_amount))
+        # Require enough data
+        if len(state.fair_price) < window:
+            return orders
 
-            elif ask_price == fair_price:
-                if state.rt_position < 0:
-                    buy_amount = min(-ask_amount, -state.rt_position)
-                    orders.append(Order(state.product, int(ask_price), int(buy_amount)))
-                    state.rt_position_update(state.rt_position + buy_amount)
-                    state.update_asks(ask_price, -(-ask_amount - buy_amount))
+        # Use Kalman filtered mean if available
+        mean_price = state.kalman_filtered_mean if hasattr(state, "kalman_filtered_mean") else np.mean(state.fair_price_history[-window:])
+        std_price = np.std(state.fair_price[-window:])
+        current_price = state.fair_price[-1]
 
-        for bid_price, bid_amount in state.bids:
-            if bid_price > fair_price:
-                sell_amount = min(bid_amount, state.possible_sell_amt)
-                if sell_amount > 0:
-                    orders.append(Order(state.product, int(bid_price), -int(sell_amount)))
-                    state.rt_position_update(state.rt_position - sell_amount)
-                    state.update_bids(bid_price, bid_amount - sell_amount)
+        upper_band = mean_price + num_std * std_price
+        lower_band = mean_price - num_std * std_price
 
-            elif bid_price == fair_price:
-                if state.rt_position > 0:
-                    sell_amount = min(bid_amount, state.rt_position)
-                    orders.append(Order(state.product, int(bid_price), -int(sell_amount)))
-                    state.rt_position_update(state.rt_position - sell_amount)
-                    state.update_bids(bid_price, bid_amount - sell_amount)
+        # Avoid trading in high volatility
+        if state.iv > iv_threshold:
+            return orders
+
+        # Filter out noisy range trading (i.e., too close to mean)
+        if abs(current_price - mean_price) < 0.2 * std_price:
+            return orders
+
+        # Avoid if spread is too high
+        if state.bid_ask_spread > 2:
+            return orders
+
+        # Buy logic
+        if current_price < lower_band and state.rt_position < state.position_limit:
+            strength = (mean_price - current_price) / std_price
+            size = min(state.possible_buy_amt, int(strength * state.position_limit))
+            if size > 0:
+                orders.append(Order(state.product, state.best_ask, size))
+                executed = min(size, state.total_askamt)
+                state.rt_position_update(state.rt_position + executed)
+
+        # Sell logic
+        elif current_price > upper_band and state.rt_position > -state.position_limit:
+            strength = (current_price - mean_price) / std_price
+            size = min(state.possible_sell_amt, int(strength * state.position_limit))
+            if size > 0:
+                orders.append(Order(state.product, state.best_bid, -size))
+                executed = min(size, state.total_bidamt)
+                state.rt_position_update(state.rt_position - executed)
 
         return orders
     
+    @staticmethod
+    def improved(state: Status, window: int = 20, num_std: float = 2.0):
+        orders = []
+
+        # Use fair price history
+        prices = state.fair_price
+        if len(prices) < window:
+            return orders  # not enough data
+
+        recent = prices[-window:]
+        mean_price = np.mean(recent)
+        std_price = np.std(recent)
+
+        upper_band = mean_price + num_std * std_price
+        lower_band = mean_price - num_std * std_price
+        current_price = prices[-1]
+
+        # Ensure we don't get eaten by spread
+        if state.bid_ask_spread > 2:
+            return orders
+
+        # Buy if price is significantly low
+        if current_price < lower_band and state.rt_position < state.position_limit:
+            buy_amount = state.possible_buy_amt
+            orders.append(Order(state.product, state.best_ask, buy_amount))
+            executed = min(buy_amount, state.total_askamt)
+            state.rt_position_update(state.rt_position + executed)
+
+        # Sell if price is significantly high
+        elif current_price > upper_band and state.rt_position > -state.position_limit:
+            sell_amount = state.possible_sell_amt
+            orders.append(Order(state.product, state.best_bid, -sell_amount))
+            executed = min(sell_amount, state.total_bidamt)
+            state.rt_position_update(state.rt_position - executed)
+
+        return orders
+    
+    @staticmethod
+    def basic(state:Status):
+        orders=[]
+        bd1=state.hist_order_depth("bidprc",depth=1,size=100)
+        bd2=state.hist_order_depth("bidprc",depth=2,size=100)
+        as1=state.hist_order_depth("askprc",depth=1,size=100)
+        as2=state.hist_order_depth("askprc",depth=2,size=100)
+        mean1=np.mean(bd1[-30:])
+        mean2=np.mean(bd1[-80:])
+        mean3=np.mean(as1[-30:])
+        mean4=np.mean(as1[-80:])
+        # currect_price=state.maxamt_midprc
+        if(mean1>mean2):
+            buy_amount = state.possible_buy_amt
+            orders.append(Order(state.product, state.best_ask, buy_amount))
+            executed_amount = min(buy_amount, state.total_askamt)
+            state.rt_position_update(state.rt_position + executed_amount)
+
+        elif(mean3<mean4):
+            sell_amount = state.possible_sell_amt
+            orders.append(Order(state.product, state.best_bid, -sell_amount))
+            executed_amount = min(sell_amount, state.total_bidamt)
+            state.rt_position_update(state.rt_position - executed_amount)
+
+        return orders
+    
+    @staticmethod
+    def bollinger(state: Status, window: int = 20, num_std_dev: float = 2.0):
+        orders = []
+        num_std_dev=state.worst_ask-state.best_bid
+
+        # Ensure enough price history
+        if len(state.fair_price) < window:
+            return orders
+
+        prices = state.fair_price[-window:]
+        mean = np.mean(prices)
+        std = np.std(prices)
+
+        upper_band = mean + num_std_dev * std
+        lower_band = mean - num_std_dev * std
+        current_price = state.maxamt_midprc
+
+        # Buy when price is below lower band
+        if current_price < lower_band:
+            buy_amount = state.possible_buy_amt
+            orders.append(Order(state.product, state.best_ask, buy_amount))
+            executed_amount = min(buy_amount, state.total_askamt)
+            state.rt_position_update(state.rt_position + executed_amount)
+
+        # Sell when price is above upper band
+        elif current_price > upper_band:
+            sell_amount = state.possible_sell_amt
+            orders.append(Order(state.product, state.best_bid, -sell_amount))
+            executed_amount = min(sell_amount, state.total_bidamt)
+            state.rt_position_update(state.rt_position - executed_amount)
+
+        return orders
+
+
     @staticmethod
     def mm_glft(
         state: Status,
@@ -772,17 +893,84 @@ class Strategy:
 
         if vol_spread > threshold:
             sell_amount = option.possible_sell_amt
-            orders.append(Order(option.product, option.worst_bid, -sell_amount))
+            orders.append(Order(option.product, option.best_bid, -sell_amount))
             executed_amount = min(sell_amount, option.total_bidamt)
             option.rt_position_update(option.rt_position - executed_amount)
 
         elif vol_spread < -threshold:
             buy_amount = option.possible_buy_amt
-            orders.append(Order(option.product, option.worst_ask, buy_amount))
+            orders.append(Order(option.product, option.best_ask, buy_amount))
             executed_amount = min(buy_amount, option.total_askamt)
             option.rt_position_update(option.rt_position + executed_amount)
 
         return orders
+    
+    @staticmethod
+    def mean_strat(state:Status,lookback:int):
+        orders=[]
+        mid_price=state.hist_order_depth("bidprc",depth=1,size=10)
+        # mid_price=np.array(state.maxamt_midprc)
+        if len(mid_price)<lookback:
+            return orders
+        last=mid_price[-lookback:]
+        first_derivative=np.mean(np.gradient(last))
+        second_derivative=np.mean(np.gradient(np.gradient(last)))
+        diff=len(last)
+        mean=last[0]+diff*first_derivative+diff*diff*second_derivative*0.5
+
+        if mean>mid_price[0]:
+            buy_amount = state.possible_buy_amt
+            orders.append(Order(state.product, state.best_ask, buy_amount))
+            executed_amount = min(buy_amount, state.total_askamt)
+            state.rt_position_update(state.rt_position + executed_amount)
+
+        if mean<mid_price[0]:
+            sell_amount = state.possible_sell_amt
+            orders.append(Order(state.product, state.best_bid, -sell_amount))
+            executed_amount = min(sell_amount, state.total_bidamt)
+            state.rt_position_update(state.rt_position - executed_amount)
+
+        return orders
+    
+
+    @staticmethod
+    def kalman(state:Status):
+        orders = []
+        
+        # Update Kalman Filter with current price
+        threshold=25
+        state.update_kalman_mean(state.maxamt_midprc)
+        current_price = state.maxamt_midprc
+        mean = state.kalman_filtered_mean
+        std = state.iv  # Use implied volatility as a proxy for price volatility
+        
+        # Calculate z-score
+        if std > 0:
+            z_score = (current_price - mean) / std
+        else:
+            z_score = 0
+
+        # Buy if price is significantly below estimated mean
+        if z_score < -threshold:
+            buy_amount = state.possible_buy_amt
+            orders.append(Order(state.product, state.best_ask, buy_amount))
+            executed_amount = min(buy_amount, state.total_askamt)
+            state.rt_position_update(state.rt_position + executed_amount)
+
+        # Sell if price is significantly above estimated mean
+        elif z_score > threshold:
+            sell_amount = state.possible_sell_amt
+            orders.append(Order(state.product, state.best_bid, -sell_amount))
+            executed_amount = min(sell_amount, state.total_bidamt)
+            state.rt_position_update(state.rt_position - executed_amount)
+
+        return orders
+    
+    
+
+
+
+
 
 
 class Trade:
@@ -801,11 +989,16 @@ class Trade:
 
     @staticmethod   
     def squid(state: Status) -> list[Order]:
-
         current_price = state.maxamt_midprc
 
         orders = []
-        orders.extend(Strategy.vol_arb(option=state))
+        # best till now
+        # orders.extend(Strategy.bollinger(state=state))
+        # orders.extend(Strategy.improved(state=state))
+        orders.extend(Strategy.improve2(state=state))
+        # orders.extend(Strategy.vol_arb(option=state))  
+        # orders.extend(Strategy.mean_strat(state=state,lookback=10))
+        # orders.extend(Strategy.kalman(state=state))
         # orders.extend(Strategy.mm_glft(state=state,fair_price=current_price))
 
         return orders
@@ -825,7 +1018,7 @@ class Trader:
 
         # round 1
         # result["AMETHYSTS"] = Trade.amethysts(self.state_amethysts)
-        result["SQUID_INK"] = Trade.squid(self.state_squid)
+        result["SQUID_INK"]= Trade.squid(self.state_squid)
         
 
         # traderData = "SAMPLE" 
