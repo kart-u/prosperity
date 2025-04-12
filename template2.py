@@ -120,6 +120,37 @@ class Logger:
 # logger = Logger()
 
 
+def reg_slope(x:List,Y:List)->float:
+    mn=min(50,len(Y))
+
+    X=np.array(x[-mn:])
+    y=np.array(Y[-mn:])
+
+    x_mean = np.mean(X)
+    y_mean = np.mean(y)
+
+    numerator = np.sum((X - x_mean) * (y - y_mean))
+    denominator = np.sum((X - x_mean) ** 2)
+    if(denominator==0):
+        return 0
+    m = numerator / denominator
+    return m
+
+def rsi(prices: list) -> float:
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+
+    avg_gain = np.mean(gains)
+    avg_loss = np.mean(losses)
+
+    if avg_loss == 0:
+        return 100  # Avoid division by zero
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
 # No need to see please do not change
 class Status:
 
@@ -165,8 +196,11 @@ class Status:
 
         """
         self.product = product
-        self.ema_mid_35=[]
-        self.ema_mid_100=[]
+        self.ema_mid_35 = []
+        self.ema_mid_100 = []
+        self.reg_slope = []
+        self.time = []
+        self.rsi=[]
 
     @classmethod
     def cls_update(cls, state: TradingState) -> None:
@@ -210,8 +244,21 @@ class Status:
         cls._num_data += 1
     
     def updates(self):
-        n35=2/36
-        n100=2/101
+        # time update
+        self.time.append(self.timestep*100)
+
+        # reg
+        self.reg_slope.append(reg_slope(self.hist_mid_prc(50),self.time))
+
+        # RSI
+        if(self.timestep>=50):
+            self.rsi.append(rsi(self.hist_mid_prc(50)))
+        else:
+            self.rsi.append(0)
+
+        # ema calc and update
+        n35=2/51
+        n100=2/1501
         if(len(self.ema_mid_35)==0):
             self.ema_mid_35.append(self.mid)
             self.ema_mid_100.append(self.mid)
@@ -623,74 +670,124 @@ class Strategy:
 
         return orders
     
+
     @staticmethod
-    def something(state:Status):
+    def basic_strat(state:Status):
+    #  working extremly well for squid ink 
+    # profit exceeded
+    # graph analysis left
         orders=[]
+        if(state.timestep<1000):
+            return orders
         
-        if(state.best_ask>state.best_bid):
-            buy_amount = state.possible_buy_amt
-            executed_amount = min(buy_amount, state.best_ask_amount)
-            orders.append(Order(state.product, state.best_ask, executed_amount))
-            state.rt_position_update(state.rt_position + executed_amount)
-
-        else:
-            sell_amount = state.possible_sell_amt
-            executed_amount = min(sell_amount, state.best_bid_amount)
-            orders.append(Order(state.product, state.best_bid, -executed_amount))
-            state.rt_position_update(state.rt_position - executed_amount)
-
-
-        return orders
-
-    @staticmethod
-    def ema_crossover(state:Status):
-        orders=[]
-        if(len(state.ema_mid_35)>=2 and state.ema_mid_35[-1]>=state.ema_mid_100[-1] and state.ema_mid_35[-2]<state.ema_mid_100[-2]):
+        ad_low=np.percentile(state.rsi[-1000:],30)
+        ad_high=np.percentile(state.rsi[-1000:],80)
+        ex_high=np.percentile(state.rsi[-1000:],98)
+        ex_low=np.percentile(state.rsi[-1000:],2)
+        # buy
+        if((len(state.ema_mid_35)>=2 and 
+            state.ema_mid_35[-1]>=state.ema_mid_100[-1]+1 and state.ema_mid_35[-2]<state.ema_mid_100[-2] and 
+            state.rsi[-1]>state.rsi[-2] and state.rsi[-1]>=ad_low) or state.rsi[-1]<=ex_low):
             for price,amount in sorted(state.all_asks,reverse=False):
                 buy_amount = state.possible_buy_amt
-                executed_amount = min(buy_amount, abs(amount))
-                orders.append(Order(state.product, price, executed_amount))
-                state.rt_position_update(state.rt_position + executed_amount)
+                executed_amount = min(buy_amount, abs(amount)) 
+                if(executed_amount>0):
+                    orders.append(Order(state.product, price, executed_amount))
+                    # print(orders[-1],state.rsi[-1],ex_low,ex_high,ad_low,ad_high)
+                    state.rt_position_update(state.rt_position + executed_amount)
 
-        # if(len(state.ema_mid_35)>=2 and state.ema_mid_100[-1]>=state.ema_mid_35[-1] and state.ema_mid_35[-2]>state.ema_mid_100[-2]):
-        #     for price,amount in sorted(state.all_bids,reverse=True):
-        #         sell_amount = state.possible_sell_amt
-        #         executed_amount = min(sell_amount, amount)
-        #         orders.append(Order(state.product, price, -executed_amount))
-        #         state.rt_position_update(state.rt_position - executed_amount)          
+        # sell
+        if  ((len(state.ema_mid_35)>=2 and 
+            state.ema_mid_100[-1]>=state.ema_mid_35[-1]+1 and state.ema_mid_35[-2]>state.ema_mid_100[-2] and 
+            state.rsi[-1]<state.rsi[-2] and state.rsi[-1]<=ad_high) or state.rsi[-1]>=ex_high):
+            for price,amount in sorted(state.all_bids,reverse=True):
+                sell_amount = state.possible_sell_amt
+                executed_amount = min(sell_amount, amount)
+                if(executed_amount>0):
+                    orders.append(Order(state.product, price, -executed_amount))
+                    # print(orders[-1],state.rsi[-1],ex_low,ex_high,ad_low,ad_high)
+                    state.rt_position_update(state.rt_position - executed_amount)          
 
         return orders
       
+    @staticmethod
+    def basic_strat2(state:Status):
+    #  working extremly well for squid ink 
+    # profit analysis done
+    # graph analysis done
+    # risk management left
+        orders=[]
+        if(state.timestep<1000):
+            return orders
+        
+        ad_low=np.percentile(state.rsi[-1000:],30)
+        ad_high=np.percentile(state.rsi[-1000:],80)
+        ex_high=np.percentile(state.rsi[-1000:],98)
+        ex_low=np.percentile(state.rsi[-1000:],2)
+        # buy
+        if((len(state.ema_mid_35)>=2 and 
+            state.ema_mid_35[-1]>=state.ema_mid_100[-1]+1 and state.ema_mid_35[-2]<state.ema_mid_100[-2] and 
+            state.rsi[-1]>state.rsi[-2] and state.rsi[-1]>=ad_low) or state.rsi[-1]<=ex_low):
+            for price,amount in sorted(state.all_asks,reverse=False):
+                buy_amount = state.possible_buy_amt
+                executed_amount = min(buy_amount, abs(amount)) 
+                if(executed_amount>0):
+                    orders.append(Order(state.product, price, executed_amount))
+                    # print(orders[-1],state.rsi[-1],ex_low,ex_high,ad_low,ad_high)
+                    state.rt_position_update(state.rt_position + executed_amount)
+
+        # sell
+        if  ((len(state.ema_mid_35)>=2 and 
+            state.ema_mid_100[-1]>=state.ema_mid_35[-1]+1 and state.ema_mid_35[-2]>state.ema_mid_100[-2] and 
+            state.rsi[-1]<state.rsi[-2] and state.rsi[-1]<=ad_high) or state.rsi[-1]>=ex_high):
+            for price,amount in sorted(state.all_bids,reverse=True):
+                sell_amount = state.possible_sell_amt
+                executed_amount = min(sell_amount, amount)
+                if(executed_amount>0):
+                    orders.append(Order(state.product, price, -executed_amount))
+                    # print(orders[-1],state.rsi[-1],ex_low,ex_high,ad_low,ad_high)
+                    state.rt_position_update(state.rt_position - executed_amount)          
+
+        return orders
+      
+
 class Trade:
 
     @staticmethod   
-    def squidInk(state: Status) -> list[Order]:
+    def SQUID_INK(state: Status) -> list[Order]:
         orders = []
-
         # all strategies here....
-        orders.extend(Strategy.ema_crossover(state=state))
+        orders.extend(Strategy.basic_strat(state=state))
 
         return orders
     
     @staticmethod   
-    def kelp(state: Status) -> list[Order]:
+    def KELP(state: Status) -> list[Order]:
         orders = []
-
         # all strategies here....
+        orders.extend(Strategy.basic_strat(state=state))
+
+        return orders
+    
+    @staticmethod   
+    def RAINFOREST_RESIN(state: Status) -> list[Order]:
+        orders = []
+        # all strategies here....
+        orders.extend(Strategy.basic_strat(state=state))
 
         return orders
 
 
 class Trader:
     # here initialise a status class for asset
-    state_squid = Status('SQUID_INK')
-    state_rain = Status('RAINFOREST_RESIN')
-    state_kelp = Status('KELP')
-    state_cross = Status('CROISSANTS')
-    state_jam = Status('JAMS')
-    state_djembe = Status('DJEMBES')
-    state_basket1 = Status('PICNIC_BASKET1')
-    state_basket2 = Status('PICNIC_BASKET2')
+    state_SQUID_INK = Status('SQUID_INK')
+    state_RAINFOREST_RESIN = Status('RAINFOREST_RESIN')
+    state_KELP = Status('KELP')
+    state_CROISSANTS = Status('CROISSANTS')
+    state_JAMS = Status('JAMS')
+    state_DJEMBES = Status('DJEMBES')
+    state_PICNIC_BASKET1 = Status('PICNIC_BASKET1')
+    state_PICNIC_BASKET2 = Status('PICNIC_BASKET2')
 
 
     def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, Any]:
@@ -698,11 +795,19 @@ class Trader:
         
         result = {}
         conversions = 0
-        traderData={}
-        if "SQUID_INK" in state.order_depths.keys():
-            self.state_squid.updates()
-            result["SQUID_INK"] = Trade.squidInk(self.state_squid)
-            traderData = self.state_squid.all_parameters()
+        traderData=''
+
+        # if "SQUID_INK" in state.order_depths.keys():
+        #     self.state_SQUID_INK.updates()
+        #     result["SQUID_INK"] = Trade.SQUID_INK(self.state_SQUID_INK)
+
+        # if "KELP" in state.order_depths.keys():
+        #     self.state_KELP.updates()
+        #     result["KELP"] = Trade.KELP(self.state_KELP)
+
+        if "RAINFOREST_RESIN" in state.order_depths.keys():
+            self.state_RAINFOREST_RESIN.updates()
+            result["RAINFOREST_RESIN"] = Trade.RAINFOREST_RESIN(self.state_RAINFOREST_RESIN)
 
 
         # when testing in local backtest comment out all logger instances
