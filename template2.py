@@ -4,6 +4,7 @@ from statistics import NormalDist
 from datamodel import *
 from typing import List, Dict, Tuple, Any
 import json
+import copy
 
 class Logger:
     def __init__(self) -> None:
@@ -203,6 +204,8 @@ class Status:
         self.rsi=[]
         self.rsi_ema=[]
         self.rain=0
+        self.buy=0
+        self.sell=0
 
     @classmethod
     def cls_update(cls, state: TradingState) -> None:
@@ -769,33 +772,73 @@ class Strategy:
         ad_high=np.percentile(state.rsi[-1000:],80)
         ex_high=np.percentile(state.rsi[-1000:],98)
         ex_low=np.percentile(state.rsi[-1000:],2)
-        # ad_low=np.percentile(state.rsi_ema[-1000:],20)
-        # ad_high=np.percentile(state.rsi_ema[-1000:],80)
-        # ex_high=np.percentile(state.rsi_ema[-1000:],95)
-        # ex_low=np.percentile(state.rsi_ema[-1000:],5)
-        # buy
+        
+        signalbuy=copy.copy(state.buy)
+        signalsell=copy.copy(state.sell)
         if((len(state.ema_mid_35)>=2 and 
             state.ema_mid_35[-1]>=state.ema_mid_100[-1]+1 and state.ema_mid_35[-2]<state.ema_mid_100[-2] and 
             state.rsi[-1]>=ad_low) or (state.rsi[-1]<=ex_low)):
+            signalbuy=1
+            signalsell=0
+            if((state.rsi[-1]<=ex_low)):
+                signalbuy=2
+
+        if(signalbuy==1):
             for price,amount in sorted(state.all_asks,reverse=False):
                 buy_amount = state.possible_buy_amt
-                executed_amount = min(buy_amount, abs(amount)) 
+                executed_amount = min(buy_amount, abs(amount))
                 if(executed_amount>0):
                     orders.append(Order(state.product, price, executed_amount))
                     print(orders[-1])
                     state.rt_position_update(state.rt_position + executed_amount)
+                
+            signalbuy=0
 
+        if(signalbuy==2):
+            for price,amount in sorted(state.all_asks,reverse=False):
+                buy_amount = state.possible_buy_amt
+                executed_amount = min(buy_amount, abs(amount))
+                if(state.rt_position<0):
+                    executed_amount = min(buy_amount, abs(state.rt_position)) 
+                if(executed_amount>0):
+                    orders.append(Order(state.product, price, executed_amount))
+                    print(orders[-1])
+                    state.rt_position_update(state.rt_position + executed_amount)
+                
+            signalbuy=0
         # sell
         if  ((len(state.ema_mid_35)>=2 and 
             state.ema_mid_100[-1]>=state.ema_mid_35[-1]+1 and state.ema_mid_35[-2]>state.ema_mid_100[-2] and 
             state.rsi[-1]<=ad_high) or (state.rsi[-1]>=ex_high)):
+            signalsell=1
+            signalbuy=0
+            if((state.rsi[-1]>=ex_high) and state.ema_mid_100[-1]<=state.ema_mid_35[-1]):
+                signalsell=2
+
+        if(signalsell==1):
             for price,amount in sorted(state.all_bids,reverse=True):
                 sell_amount = state.possible_sell_amt
-                executed_amount = min(sell_amount, amount)
+                executed_amount = min(sell_amount, amount)           
                 if(executed_amount>0):
                     orders.append(Order(state.product, price, -executed_amount))
                     print(orders[-1])
-                    state.rt_position_update(state.rt_position - executed_amount)          
+                    state.rt_position_update(state.rt_position - executed_amount)   
+
+            signalsell=0   
+
+        if(signalsell==2):
+            for price,amount in sorted(state.all_bids,reverse=True):
+                sell_amount = state.possible_sell_amt
+                executed_amount = min(sell_amount, amount)
+                if(state.rt_position>0): 
+                    executed_amount=min(executed_amount,state.rt_position)
+                if(executed_amount>0):
+                    orders.append(Order(state.product, price, -executed_amount))
+                    print(orders[-1])
+                    state.rt_position_update(state.rt_position - executed_amount)   
+                
+            signalsell=0
+
 
         return orders
       
@@ -927,7 +970,6 @@ class Strategy:
 
             return orders
 
-
     @staticmethod
     def basic_strat2(state:Status):
     #  working extremly well for squid ink 
@@ -983,7 +1025,6 @@ class Trade:
         orders = []
         # all strategies here....
         orders.extend(Strategy.kelp_adaptive_mm(state=state))
-
         return orders
     
     @staticmethod   
@@ -991,7 +1032,6 @@ class Trade:
         orders = []
         # all strategies here....
         orders.extend(Strategy.hardcode(state=state))
-
         return orders
 
 
