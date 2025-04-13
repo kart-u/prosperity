@@ -117,7 +117,7 @@ class Logger:
             return value
 
         return value[: max_length - 3] + "..."
-# logger = Logger()
+logger = Logger()
 
 
 def reg_slope(x:List,Y:List)->float:
@@ -201,6 +201,8 @@ class Status:
         self.reg_slope = []
         self.time = []
         self.rsi=[]
+        self.rsi_ema=[]
+        self.rain=0
 
     @classmethod
     def cls_update(cls, state: TradingState) -> None:
@@ -258,15 +260,19 @@ class Status:
 
         # ema calc and update
         n35=2/51
-        n100=2/1501
+        n100=2/2001
         if(len(self.ema_mid_35)==0):
             self.ema_mid_35.append(self.mid)
+            self.rsi_ema.append(self.rsi[-1])
             self.ema_mid_100.append(self.mid)
+
         else:
             num=self.ema_mid_35[-1]*(1-n35)+n35*self.mid
             num2=self.ema_mid_100[-1]*(1-n100)+n100*self.mid
+            num3=self.rsi_ema[-1]*(1-n35)+n35*self.rsi[-1]
             self.ema_mid_35.append(num)
             self.ema_mid_100.append(num2)
+            self.rsi_ema.append(num3)
 
         
     def hist_order_depth(self, type: str, depth: int, size) -> np.ndarray:
@@ -617,19 +623,46 @@ class Status:
     def total_askamt(self) -> int:
         return -sum(self._state.order_depths[self.product].sell_orders.values())
     
-    def all_parameters(self):
-        return {
-            "best_bid":self.best_bid,
-            "best_ask":self.best_ask,
-            "vwap":self.hist_vwap_all(1)[0],
-            "mid_price":self.mid,
-            "possible_Buy":self.possible_buy_amt,
-            "possible_Sell":self.possible_sell_amt,
-            "timestamp":self.timestep*100,
-            "ema_35":self.ema_mid_35[-1],
-            "ema_100":self.ema_mid_100[-1],
-        }
+    @property
+    def avg_bid(self)->int:
+        sum=0
+        vol=0
+        for price,volume in self.all_bids:
+            sum+=price*volume
+            vol+=volume
+        return sum/volume
+    
+    @property
+    def avg_ask(self)->int:
+        sum=0
+        vol=0
+        for price,volume in self.all_asks:
+            sum+=price*volume
+            vol+=volume
+        return sum/volume
 
+    @property
+    def vwap_fair_price(self) -> float:
+        """Calculate fair price based on volume-weighted average price of bids and asks."""
+        buy_orders = self._state.order_depths[self.product].buy_orders
+        sell_orders = self._state.order_depths[self.product].sell_orders
+
+        if not buy_orders or not sell_orders:
+            return self.mid # Fallback to simple mid if book is empty/one-sided
+
+        total_bid_value = sum(p * v for p, v in buy_orders.items())
+        total_bid_volume = sum(buy_orders.values())
+
+        total_ask_value = sum(p * abs(v) for p, v in sell_orders.items())
+        total_ask_volume = sum(abs(v) for v in sell_orders.values())
+
+        if total_bid_volume == 0 or total_ask_volume == 0:
+            return self.mid # Fallback if one side has zero volume
+
+        avg_bid = total_bid_value / total_bid_volume
+        avg_ask = total_ask_value / total_ask_volume
+
+        return (avg_bid + avg_ask) / 2.0
 
 
 # All strategies here
@@ -670,46 +703,231 @@ class Strategy:
 
         return orders
     
-
     @staticmethod
-    def basic_strat(state:Status):
-    #  working extremly well for squid ink 
-    # profit exceeded
-    # graph analysis left
+    def fair_price_arbitrage(state:Status):
+        fair=(state.avg_ask+state.avg_bid)/2
         orders=[]
-        if(state.timestep<1000):
-            return orders
-        
-        ad_low=np.percentile(state.rsi[-1000:],30)
-        ad_high=np.percentile(state.rsi[-1000:],80)
-        ex_high=np.percentile(state.rsi[-1000:],98)
-        ex_low=np.percentile(state.rsi[-1000:],2)
-        # buy
-        if((len(state.ema_mid_35)>=2 and 
-            state.ema_mid_35[-1]>=state.ema_mid_100[-1]+1 and state.ema_mid_35[-2]<state.ema_mid_100[-2] and 
-            state.rsi[-1]>state.rsi[-2] and state.rsi[-1]>=ad_low) or state.rsi[-1]<=ex_low):
-            for price,amount in sorted(state.all_asks,reverse=False):
+        for price,amount in sorted(state.all_asks,reverse=True):
+            if(price<=fair-1):
                 buy_amount = state.possible_buy_amt
                 executed_amount = min(buy_amount, abs(amount)) 
+                state.last_price=price
                 if(executed_amount>0):
                     orders.append(Order(state.product, price, executed_amount))
                     # print(orders[-1],state.rsi[-1],ex_low,ex_high,ad_low,ad_high)
                     state.rt_position_update(state.rt_position + executed_amount)
 
+        for price,amount in sorted(state.all_bids,reverse=False):
+                if(price>=fair+1):    
+                    sell_amount = state.possible_sell_amt
+                    executed_amount = min(sell_amount, amount)
+                    state.last_price=price
+                    if(executed_amount>0):
+                        orders.append(Order(state.product, price, -executed_amount))
+                        # print(orders[-1],state.rsi[-1],ex_low,ex_high,ad_low,ad_high)
+                        state.rt_position_update(state.rt_position - executed_amount)
+        return orders
+
+    @staticmethod
+    def hardcode(state:Status):
+        orders=[]      
+        for price,amount in sorted(state.all_asks,reverse=True):
+            if(price<=10000):
+                buy_amount = state.possible_buy_amt
+                executed_amount = min(buy_amount, abs(amount)) 
+                if(executed_amount>0):
+                    if(price==9998):
+                        state.rain+=executed_amount
+                    orders.append(Order(state.product, price, executed_amount))
+                    print(orders[-1],price,executed_amount)
+                    state.rt_position_update(state.rt_position + executed_amount)
+
+        for price,amount in sorted(state.all_bids,reverse=False):
+            if(price>10000) or (state.rain>0 and price==10000):    
+                sell_amount = state.possible_sell_amt
+                executed_amount = min(sell_amount, amount)
+                if(executed_amount>0):
+                    if(price==10000):
+                        state.rain-=executed_amount
+                    orders.append(Order(state.product, price, -executed_amount))
+                    print(orders[-1],price,-executed_amount)
+                    state.rt_position_update(state.rt_position - executed_amount) 
+
+        return orders
+      
+    @staticmethod
+    def basic_strat(state:Status):
+    #  working extremly well for squid ink 
+    # profit analysis done
+    # graph analysis done
+    # risk management left
+        orders=[]
+        if(state.timestep<1000):
+            return orders
+        
+        ad_low=np.percentile(state.rsi[-1000:],20)
+        ad_high=np.percentile(state.rsi[-1000:],80)
+        ex_high=np.percentile(state.rsi[-1000:],98)
+        ex_low=np.percentile(state.rsi[-1000:],2)
+        # ad_low=np.percentile(state.rsi_ema[-1000:],20)
+        # ad_high=np.percentile(state.rsi_ema[-1000:],80)
+        # ex_high=np.percentile(state.rsi_ema[-1000:],95)
+        # ex_low=np.percentile(state.rsi_ema[-1000:],5)
+        # buy
+        if((len(state.ema_mid_35)>=2 and 
+            state.ema_mid_35[-1]>=state.ema_mid_100[-1]+1 and state.ema_mid_35[-2]<state.ema_mid_100[-2] and 
+            state.rsi[-1]>=ad_low) or (state.rsi[-1]<=ex_low)):
+            for price,amount in sorted(state.all_asks,reverse=False):
+                buy_amount = state.possible_buy_amt
+                executed_amount = min(buy_amount, abs(amount)) 
+                if(executed_amount>0):
+                    orders.append(Order(state.product, price, executed_amount))
+                    print(orders[-1])
+                    state.rt_position_update(state.rt_position + executed_amount)
+
         # sell
         if  ((len(state.ema_mid_35)>=2 and 
             state.ema_mid_100[-1]>=state.ema_mid_35[-1]+1 and state.ema_mid_35[-2]>state.ema_mid_100[-2] and 
-            state.rsi[-1]<state.rsi[-2] and state.rsi[-1]<=ad_high) or state.rsi[-1]>=ex_high):
+            state.rsi[-1]<=ad_high) or (state.rsi[-1]>=ex_high)):
             for price,amount in sorted(state.all_bids,reverse=True):
                 sell_amount = state.possible_sell_amt
                 executed_amount = min(sell_amount, amount)
                 if(executed_amount>0):
                     orders.append(Order(state.product, price, -executed_amount))
-                    # print(orders[-1],state.rsi[-1],ex_low,ex_high,ad_low,ad_high)
+                    print(orders[-1])
                     state.rt_position_update(state.rt_position - executed_amount)          
 
         return orders
       
+    @staticmethod
+    def kelp_adaptive_mm(state: Status) -> list[Order]:
+        """Adaptive market making for KELP using EMA, inventory skew, and adaptive sizing."""
+        orders = []
+        product = state.product # Should be "KELP"
+        limit = state.position_limit
+        position = state.rt_position # Use real-time position for decisions
+
+        # --- Parameters ---
+        MIN_SPREAD = 2
+        BASE_ORDER_SIZE = 15        # Max order size when near neutral inventory
+        MIN_ORDER_SIZE = 3          # Minimum order size to place
+        SPREAD_CAPTURE_RATIO = 0.4  # Target % of bid-ask spread to capture on each side
+        INVENTORY_SKEW_FACTOR = 1.5 # How aggressively prices are skewed based on inventory (higher = more aggressive)
+        SIZE_REDUCTION_FACTOR = 0.8 # How much max size reduces based on inventory (0 to 1)
+
+        # --- Pre-computation & Checks ---
+        if not state.all_bids or not state.all_asks: return []
+
+        spread = state.best_ask - state.best_bid
+        if spread < MIN_SPREAD: return []
+
+        # Use the smoothed EMA fair price for KELP
+        smoothed_fair_price = state.fair_price_ema_kelp
+        if smoothed_fair_price is None: return [] # Wait for EMA warmup
+
+        # --- Inventory Skew Calculation ---
+        inventory_ratio = position / limit # Ranges from -1 to 1
+        # Skew prices: If long (ratio > 0), lower both buy and sell prices. If short (ratio < 0), raise both.
+        price_skew = inventory_ratio * (spread / 2.0) * INVENTORY_SKEW_FACTOR
+
+        # --- Adaptive Size Calculation ---
+        # Reduce max size as inventory moves away from zero
+        size_penalty = abs(inventory_ratio) * BASE_ORDER_SIZE * SIZE_REDUCTION_FACTOR
+        current_max_size = max(MIN_ORDER_SIZE, int(BASE_ORDER_SIZE - size_penalty))
+
+        # --- Price Calculation ---
+        # Calculate base offset from smoothed fair price
+        price_offset = max(1, int(spread * SPREAD_CAPTURE_RATIO)) # Ensure at least 1 point offset
+
+        # Calculate skewed buy/sell prices
+        target_buy_price = int(smoothed_fair_price - price_offset - price_skew)
+        target_sell_price = int(smoothed_fair_price + price_offset - price_skew) # Still subtract skew!
+
+        # Ensure sell price is always >= buy price + 1 (basic sanity)
+        target_sell_price = max(target_sell_price, target_buy_price + 1)
+
+        # --- Volume Calculation ---
+        buy_volume = min(current_max_size, state.possible_buy_amt)
+        sell_volume = min(current_max_size, state.possible_sell_amt)
+
+        # --- Order Placement ---
+        if buy_volume >= MIN_ORDER_SIZE: # Only place if size meets minimum
+            orders.append(Order(product, target_buy_price, buy_volume))
+            state.rt_position_update(state.rt_position + buy_volume)
+            # Optional Log: print(f"KELP: BUY {buy_volume}@{target_buy_price} (Skew:{price_skew:.2f}|Pos:{position})")
+
+
+        # Re-check possible sell amount in case buy order changed rt_position significantly, although min() should handle it
+        # sell_volume = min(current_max_size, state.possible_sell_amt) # Can recalculate if paranoid
+
+        if sell_volume >= MIN_ORDER_SIZE: # Only place if size meets minimum
+            orders.append(Order(product, target_sell_price, -sell_volume))
+            state.rt_position_update(state.rt_position - sell_volume)
+            # Optional Log: print(f"KELP: SELL {sell_volume}@{target_sell_price} (Skew:{price_skew:.2f}|Pos:{position})")
+
+
+        return orders
+
+        @staticmethod
+        def resin_ema_mm(state: Status) -> list[Order]:
+            """Market making based on EMA of VWAP fair value for RAINFOREST_RESIN."""
+            orders = []
+            product = state.product # Should be "RAINFOREST_RESIN"
+            MIN_SPREAD = 2
+            BASE_VOLUME_FACTOR = 15 # Base component of order size
+            LIQUIDITY_SENSITIVITY = 20 # How much liquidity affects order size
+
+            # Check if order book has both sides
+            if not state.all_bids or not state.all_asks:
+                # print(f"{product}: Missing bids or asks.") # Optional log
+                return []
+
+            spread = state.best_ask - state.best_bid
+            if spread < MIN_SPREAD:
+                # print(f"{product}: Spread too tight ({spread}), skipping.") # Optional log
+                return []
+
+            # EMA is updated in Trader.run *before* calling this strategy
+            smoothed_price = state.fair_price_ema
+            if smoothed_price is None:
+                # print(f"{product}: EMA not yet calculated.") # Optional log
+                return [] # Need EMA warmup
+
+            # Determine Buy/Sell Prices based on EMA and spread
+            # Using 0.48 factor from original code
+            buy_price = int(smoothed_price - spread * 0.48)
+            sell_price = int(smoothed_price + spread * 0.48)
+
+            # Determine Volumes
+            available_buy_liquidity = state.get_ask_volume_le(buy_price)
+            available_sell_liquidity = state.get_buy_volume_ge(sell_price)
+            limit_factor = min(state.total_bid_vol, state.total_ask_vol)
+            # Avoid division by zero or extreme values if limit_factor is small
+            liquidity_component = (limit_factor / 100.0) * LIQUIDITY_SENSITIVITY if limit_factor > 0 else 0
+            base_volume = int(BASE_VOLUME_FACTOR + liquidity_component)
+
+            # Calculate desired volume, considering base size and available liquidity at target price
+            desired_buy_vol = max(base_volume, available_buy_liquidity)
+            desired_sell_vol = max(base_volume, available_sell_liquidity)
+
+            # Final volume capped by position limits
+            buy_volume = max(0, min(desired_buy_vol, state.possible_buy_amt))
+            sell_volume = max(0, min(desired_sell_vol, state.possible_sell_amt))
+
+            # Place Orders (redundant limit checks removed, handled by possible_buy/sell_amt)
+            if buy_volume > 0:
+                orders.append(Order(product, buy_price, buy_volume))
+                state.rt_position_update(state.rt_position + buy_volume)
+                # print(f"{product}: BUY {buy_volume} @ {buy_price} | EMA: {smoothed_price:.2f}") # Optional log
+
+            if sell_volume > 0:
+                orders.append(Order(product, sell_price, -sell_volume))
+                state.rt_position_update(state.rt_position - sell_volume)
+                # print(f"{product}: SELL {sell_volume} @ {sell_price} | EMA: {smoothed_price:.2f}") # Optional log
+
+            return orders
+
+
     @staticmethod
     def basic_strat2(state:Status):
     #  working extremly well for squid ink 
@@ -750,7 +968,6 @@ class Strategy:
 
         return orders
       
-
 class Trade:
 
     @staticmethod   
@@ -765,7 +982,7 @@ class Trade:
     def KELP(state: Status) -> list[Order]:
         orders = []
         # all strategies here....
-        orders.extend(Strategy.basic_strat(state=state))
+        orders.extend(Strategy.kelp_adaptive_mm(state=state))
 
         return orders
     
@@ -773,7 +990,7 @@ class Trade:
     def RAINFOREST_RESIN(state: Status) -> list[Order]:
         orders = []
         # all strategies here....
-        orders.extend(Strategy.basic_strat(state=state))
+        orders.extend(Strategy.hardcode(state=state))
 
         return orders
 
@@ -797,17 +1014,17 @@ class Trader:
         conversions = 0
         traderData=''
 
-        # if "SQUID_INK" in state.order_depths.keys():
-        #     self.state_SQUID_INK.updates()
-        #     result["SQUID_INK"] = Trade.SQUID_INK(self.state_SQUID_INK)
+        if "SQUID_INK" in state.order_depths.keys():
+            self.state_SQUID_INK.updates()
+            result["SQUID_INK"] = Trade.SQUID_INK(self.state_SQUID_INK)
 
         # if "KELP" in state.order_depths.keys():
         #     self.state_KELP.updates()
         #     result["KELP"] = Trade.KELP(self.state_KELP)
 
-        if "RAINFOREST_RESIN" in state.order_depths.keys():
-            self.state_RAINFOREST_RESIN.updates()
-            result["RAINFOREST_RESIN"] = Trade.RAINFOREST_RESIN(self.state_RAINFOREST_RESIN)
+        # if "RAINFOREST_RESIN" in state.order_depths.keys():
+        #     self.state_RAINFOREST_RESIN.updates()
+        #     result["RAINFOREST_RESIN"] = Trade.RAINFOREST_RESIN(self.state_RAINFOREST_RESIN)
 
 
         # when testing in local backtest comment out all logger instances
